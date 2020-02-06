@@ -1,2 +1,2 @@
-# CDP
-Conjoined Dirichlet Process 
+# CDP : Conjoined Dirichlet Process 
+
