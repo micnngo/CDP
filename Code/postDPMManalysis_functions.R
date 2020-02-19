@@ -4,14 +4,33 @@
 
 ### Libraries 
 
+package_list <- c("ggplot2", "gridExtra", "JuliaCall", "parallel", 
+                  "plyr", "dplyr", "reshape2", "Rcpp", "RcppParallel")
+new_packages <- package_list[!(package_list %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+bio_package_list <- c("rhdf5")
+new_bio_packages <- bio_package_list[!(bio_package_list %in% installed.packages()[,"Package"])]
+if(length(new_bio_packages)) BiocManager::install(new_bio_packages)
+
 library(ggplot2)
 library(gridExtra)
 library(JuliaCall)
-library(rhdf5)
+library(rhdf5)    # for saving Julia output
 library(parallel)
 library(plyr)
 library(dplyr)
 library(reshape2) # for acast
+library(Rcpp)
+library(RcppParallel)
+
+
+julia_library("DPMMSubClusters")
+julia_library("Random")
+julia_library("DataFrames")
+julia_library("HDF5")
+
 
 ### Gets LogLikelihood and Total Num of Clusters per Iteration 
 get_LL_and_NClust <- function(DPMMfitresult){
@@ -48,12 +67,14 @@ plot_HGLL <- function(df, fdir, fheader){
   return(plts)
 }
 
+
+
 ### Gets the top_n most probable total number of clusters
 get_top_clusters <- function(NC, top_n=3){
-  # inputs
+  # input
   #   NC : vector of total number of clusters at each iteration
   #   top_n : returns the n most probable number of clusters 
-  
+  # returns (top_n x 2) dataframe showing the max number of clusters (K) and its probability 
   tbl = table(NC)
   tbl_ordered = tbl[order(-tbl)]/sum(tbl)
   df = data.frame(tbl_ordered[1:top_n])
@@ -68,13 +89,12 @@ get_top_clusters <- function(NC, top_n=3){
 }
 
 ### Gets the last index of the DPMM iteration where Total Num of Clusters = top 
-get_z_idx <- function(NC, top_n, top, verbose = FALSE){
+get_z_idx <- function(NC, top_n, top){
   # input
   #   NC: total number of clusters per iteration
   #   top: int from 1 to top_n; rtop[top] chooses K for rows 
   most_probable_MAP = get_top_clusters(NC, top_n)
-  if (verbose) 
-    print(most_probable_MAP)
+  print(most_probable_MAP)
   indexes = which(NC == most_probable_MAP$NumClusters[top])
   lastidx = indexes[length(indexes)]
   return(lastidx)
@@ -100,12 +120,11 @@ z_name_convention <- function(z_updated){
 }
 
 
+##### 
+### Splits lists to calculate phi_r, phi_c and theta 
+#####
 
-
-# Splits lists to calculate phi_r, phi_c and theta 
-
-# splits each expanded list of assignments into sublists of length 
-# according to data matrix 
+# splits each expanded list of assignments into sublists of length according to data matrix 
 splitvec <- function(vec, splitlen){
   sv = split(vec, rep(seq_along(splitlen), splitlen))
   return(sv)
@@ -127,8 +146,6 @@ splitz <- function(zlist, df, zdir='row'){
 
 
 ### Calculates the frequency of each row and col cluster assignment 
-# Needed to calculate theta 
-
 calc_frequency_list <- function(z_r_exp, z_c_exp, df){
   frequency_list <- list()
   for(i in 1:length(z_c_exp)){
@@ -139,7 +156,7 @@ calc_frequency_list <- function(z_r_exp, z_c_exp, df){
   return(frequency_list)
 }
 
-
+# creates a list of tallied counts (not condensed)
 applytally2 <- function(sublist, other_list, df, current_idx){
   # the other list MUST BE z_r_expand 
   sublist_length = length(sublist)
@@ -147,7 +164,6 @@ applytally2 <- function(sublist, other_list, df, current_idx){
   
   tally_list <- list()
   for(i in 1:sublist_length){
-    
     #print(length(sublist[[i]]))
     #print(length(other_list[[other_list_names[i]]][[current_idx]]))
     #print(i)
@@ -155,11 +171,10 @@ applytally2 <- function(sublist, other_list, df, current_idx){
     tally_list[[i]] <- match_columns(sublist[[i]], other_list[[other_list_names[i]]], current_idx)
     #print(tally_list)
   }
-  
   return(tally_list)
 }
 
-
+# tabulates the row and col vectors 
 match_columns <- function(ref_vector, other_sublist, current_idx){
   # tables pairings between two vectors
   other_vector = other_sublist[[as.character(current_idx)]]
@@ -172,7 +187,7 @@ match_columns <- function(ref_vector, other_sublist, current_idx){
 
 
 
-# converts nested list of frequencies into a data frame with duplicated entries 
+### converts nested list of frequencies into a data frame with duplicated entries 
 get_freq_list <- function(freq_nestedlists){
   # changes output of lapply where function is applytally to long data frame of freq
   freq_list = lapply(freq_nestedlists, function(x) reshape2::melt(x, id=c("rvec", "cvec")))
@@ -182,7 +197,7 @@ get_freq_list <- function(freq_nestedlists){
   return(freq_longdf)
 }
 
-# transforms data frame from get_freq_list into data frame version of theta 
+### transforms data frame from get_freq_list into data frame version of theta 
 get_freq_table <- function(freq_df){
   # data should be in format: rvec, cvec, variable (Freq), value
   # gives theta in data.frame format 
@@ -193,7 +208,7 @@ get_freq_table <- function(freq_df){
   return(freq_df)
 }
 
-# transforms theta (data frame) into contingency table version 
+### transforms theta (data frame) into contingency table version 
 theta_into_table <- function(theta, valtype = "Freq"){
   # value type: "Freq" or "Prob" 
   # theta format: rvec, cvec, Freq, Prob
@@ -204,7 +219,7 @@ theta_into_table <- function(theta, valtype = "Freq"){
   return(contin_table)
 }
 
-# plot heatmap of theta 
+### plot heatmap of theta 
 plot_theta <- function(theta_df, filltype = "Prob", fname){
   thetafig <- ggplot(theta_df, aes(y=rvec, x=cvec )) + 
     geom_tile(aes_string(fill = filltype), color="grey") +
@@ -218,38 +233,22 @@ plot_theta <- function(theta_df, filltype = "Prob", fname){
 }
 
 
-# plot heatmap of phi_r
-plot_phi_r <- function(phi_r){
-  rfig <- ggplot(phi_r, aes(y=rvec, x=cvec )) + 
-    geom_tile(aes_string(fill = filltype), color="grey") +
-    scale_x_discrete(limits = as.character(sort(as.integer(levels(theta_df$cvec))))) + 
-    scale_y_discrete(limits = as.character(sort(as.integer(levels(theta_df$rvec))))) + 
-    labs(y = "Latent Row Var", x = "Latent Col Var", fill = filltype) + 
-    theme(axis.text.x = element_text(size=40), axis.text.y = element_text(size=40), aspect.ratio = 1, text = element_text(size=40), axis.title = element_text(size=40), legend.text=element_text(size=40),
-          legend.title=element_text(size=40), legend.key.size = unit(3,"line"))
-  #ggsave(rfig, filename = fname, scale=2, dpi = 'retina', width = 11, height = 8, units="in", device="pdf")  
-  return(rfig)
+### determines the most probable cluster assignments
+most_probable_z <- function(phi){
+  # input: phi_r or phi_c data frame 
+  probable_z = unlist(apply(phi, 1, function(x) which(x == max(x)) ))
+
+  return(probable_z)
 }
 
 
-
-
-# ### OLD FUNCTIONS
-# # calculates frequency of each pairing (11, 12, 21, 22)
-# tallycombo <- function(cvec, clist, zc_col){
-#   # go over entire "row" (z_r) at a time -> technically go over each column 
-#   # returns frequency of each pairing
-#   rvec = clist[[zc_col]]
-#   tally = data.frame(table(data.frame(rvec, cvec)))
-#   return(tally)
-# }
-# 
-# # applies tally function to each element (vectorized format) 
-# applytally <- function(zr_sublist, zc_list, col, df){
-#   # need entire z_c_list and which column to tally  
-#   len_zr_sub = length(zr_sublist)
-#   zc_names = colnames(df)[as.integer(names(zr_sublist))]
-#   zc_cols = unlist(lapply(zc_names, function(x) which(names(zc_list[[x]]) == col)))
-#   freq = lapply(1:len_zr_sub, function(x) tallycombo(zr_sublist[[x]], zc_list[[zc_names[x]]], zc_cols[x]))
-#   return(freq)
-# }
+### gets indicies of observations in cluster K = group_number
+get_group_idx <- function(unlisted_group, group_number){
+  # inputs:
+  #   unlisted_group: unlisted array of most probable cluster assignments for each observation (need phi_r/phi_c)
+  #   group_number: which cluster is of interest 
+  grp = names(which(unlisted_group == group_number))
+  idx =  as.numeric( unique(unlist(lapply(sapply(grp, function(x) strsplit(x, ".V")), "[[", 1))) )
+  
+  return(idx)
+}
